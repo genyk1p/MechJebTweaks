@@ -8,6 +8,7 @@
     "$kref": "#/ckan/github/genyk1p/MechJebTweaks",
     "$vref": "#/ckan/ksp-avc",
     "resources": {
+        "homepage": "https://forum.kerbalspaceprogram.com/topic/231955-*",
         "repository": "https://github.com/genyk1p/MechJebTweaks",
         "bugtracker": "https://github.com/genyk1p/MechJebTweaks/issues"
     },

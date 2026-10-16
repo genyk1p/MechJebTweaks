@@ -2,6 +2,8 @@
 
 Small additions to [MechJeb2](https://github.com/MuMech/MechJeb2). MechJeb's own files are not modified; each feature can be switched off in `Settings.cfg`.
 
+Forum thread: https://forum.kerbalspaceprogram.com/topic/231955-112x-mechjeb-tweaks-010-safe-rendezvous-step-by-step-docking-autopilot-warp-guard-and-more-for-mechjeb/
+
 ## 1. Warp guard
 
 ### The problem
