@@ -1,0 +1,10 @@
+# build output
+src/bin/
+src/obj/
+GameData/*/Plugins/*.dll
+GameData/*/Plugins/*.pdb
+dist/
+# IDE
+.vs/
+.vscode/
+*.user

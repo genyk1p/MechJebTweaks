@@ -1,0 +1,63 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!-- MechJeb is built for 4.8; KSP's Mono runs it fine. -->
+    <TargetFramework>net48</TargetFramework>
+    <LangVersion>8.0</LangVersion>
+    <AssemblyName>MechJebTweaks</AssemblyName>
+    <RootNamespace>MechJebTweaks</RootNamespace>
+    <Version>0.1.0</Version>
+    <Product>MechJeb Tweaks</Product>
+    <Description>Additions to MechJeb: warp guard, safe rendezvous with offset, docking autopilot, auto physics warp and more.</Description>
+    <Copyright>Copyright (c) 2026 Geny, GPL-3.0</Copyright>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <DebugType>portable</DebugType>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <!-- The built DLL goes straight into the release layout. -->
+    <OutputPath>..\GameData\MechJebTweaks\Plugins\</OutputPath>
+  </PropertyGroup>
+
+  <!-- KSP install: override with the KSPDIR environment variable or /p:KSPDIR=... -->
+  <PropertyGroup>
+    <KSPDIR Condition="'$(KSPDIR)' == ''">C:\Program Files (x86)\Steam\steamapps\common\Kerbal Space Program</KSPDIR>
+    <KSPManaged>$(KSPDIR)\KSP_x64_Data\Managed</KSPManaged>
+    <MechJebPlugins>$(KSPDIR)\GameData\MechJeb2\Plugins</MechJebPlugins>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3" PrivateAssets="all" />
+  </ItemGroup>
+
+  <!-- Compile-time references only: nothing from here is copied to the output. -->
+  <ItemGroup>
+    <Reference Include="Assembly-CSharp">
+      <HintPath>$(KSPManaged)\Assembly-CSharp.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine">
+      <HintPath>$(KSPManaged)\UnityEngine.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.CoreModule">
+      <HintPath>$(KSPManaged)\UnityEngine.CoreModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.IMGUIModule">
+      <HintPath>$(KSPManaged)\UnityEngine.IMGUIModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="0Harmony">
+      <HintPath>$(KSPDIR)\GameData\000_Harmony\0Harmony.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="MechJeb2">
+      <HintPath>$(MechJebPlugins)\MechJeb2.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="MechJebLib">
+      <HintPath>$(MechJebPlugins)\MechJebLib.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+</Project>

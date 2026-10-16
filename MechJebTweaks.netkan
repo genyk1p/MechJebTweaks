@@ -1,0 +1,26 @@
+{
+    "spec_version": "v1.4",
+    "identifier": "MechJebTweaks",
+    "name": "MechJeb Tweaks",
+    "abstract": "Additions to MechJeb: warp guard, safe rendezvous with offset, step-by-step RCS docking autopilot, auto physics warp for nodes, KSPIE thrust fix.",
+    "author": "Geny",
+    "license": "GPL-3.0",
+    "$kref": "#/ckan/github/genyk1p/MechJebTweaks",
+    "$vref": "#/ckan/ksp-avc",
+    "resources": {
+        "repository": "https://github.com/genyk1p/MechJebTweaks",
+        "bugtracker": "https://github.com/genyk1p/MechJebTweaks/issues"
+    },
+    "tags": [ "plugin", "control" ],
+    "depends": [
+        { "name": "MechJeb2", "min_version": "2.15.3.1" },
+        { "name": "Harmony2", "min_version": "2.2.1.0" }
+    ],
+    "supports": [
+        { "name": "KSPInterstellarExtended" },
+        { "name": "SCANsat" }
+    ],
+    "install": [
+        { "find": "MechJebTweaks", "install_to": "GameData" }
+    ]
+}
