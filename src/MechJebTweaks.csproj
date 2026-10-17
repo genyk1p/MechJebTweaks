@@ -6,7 +6,7 @@
     <LangVersion>8.0</LangVersion>
     <AssemblyName>MechJebTweaks</AssemblyName>
     <RootNamespace>MechJebTweaks</RootNamespace>
-    <Version>0.1.0</Version>
+    <Version>0.1.1</Version>
     <Product>MechJeb Tweaks</Product>
     <Description>Additions to MechJeb: warp guard, safe rendezvous with offset, docking autopilot, auto physics warp and more.</Description>
     <Copyright>Copyright (c) 2026 Geny, GPL-3.0</Copyright>

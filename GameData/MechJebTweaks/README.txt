@@ -1,14 +1,14 @@
-MechJeb Tweaks 0.1.0
+MechJeb Tweaks 0.1.1
 
 Additions to MechJeb2 (MechJeb's own files are not modified):
 - warp guard: no on-rails warp while engines still give thrust;
-- "Rendezvous with offset" window and a safe automatic rendezvous that stops a set
+- "Rendezvous with offset (Geny)" window and a safe automatic rendezvous that stops a set
   distance (100 m by default) from the target;
-- "Docking" window with a step-by-step RCS docking autopilot;
+- "Docking (Geny)" window with a step-by-step RCS docking autopilot;
 - "RCS and reaction wheel check" window (editor and flight);
 - waypoints as landing sites, real thrust of KSPIE thermal nozzles for MechJeb;
 - auto physics warp for MechJeb's maneuver nodes;
-- "Flight recorder" window for bug reports.
+- "Black box" window for bug reports.
 Settings: Settings.cfg in this folder. Details: https://github.com/genyk1p/MechJebTweaks
 Requires MechJeb2 2.15.3.1+ and Harmony 2.2.1+. Safe to add to or remove from an existing save.
 

@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using KSP.Localization;
 using MechJebTweaks.Docking;
 using MechJebTweaks.PhysicsWarp;
@@ -13,13 +14,19 @@ namespace MechJebTweaks.Rendezvous
     /// executed by MechJeb's node executor, and only then is the next one chosen. Errors of long burns
     /// (KSPIE thermal nozzles) therefore do not pile up.
     ///
-    /// Preparation, chosen anew after every burn, first matching rule wins:
-    ///   1. orbit eccentric → circularize; the first time at the apsis whose whole route is better
-    ///      (ChooseRoute: less dV unless much slower), later at the apsis nearest the aimed radius;
+    /// At the start, from an eccentric orbit or one in another plane, the whole route is chosen once
+    /// (ChooseRoute: less dV unless much slower): circularize at either apsis first, or one burn at a node
+    /// (an apsis when the planes are close) that turns the plane and puts the opposite apsis at a waiting
+    /// orbit next to the target. Then, anew after every burn, first matching rule wins:
+    ///   0. that one burn of the chosen route, if any;
+    ///   1. orbit eccentric → circularize at the apsis nearest the aimed radius (the chosen apsis, or the
+    ///      waiting orbit);
     ///   2. planes differ by more than Settings.RzPlaneAngle → match planes at the nearest node;
-    ///   3. our orbit too close in size to the target's (once per run) → raise (or lower) the opposite
-    ///      apsis to the waiting orbit; rule 1 then circularizes there;
-    ///   4. otherwise the safe Hohmann transfer (OffsetMath), which ends the preparation.
+    ///   3. no waiting orbit yet and our orbit too close in size to the target's, or so far that the braking
+    ///      after a direct transfer would be too long for one burn → raise (or lower) the opposite apsis to
+    ///      the waiting orbit; rule 1 then circularizes there;
+    ///   4. otherwise the safe Hohmann transfer (OffsetMath), refused before the burn if its braking would be
+    ///      too long; it ends the preparation.
     /// Then: mid-course correction with RCS only (skipped without RCS), then velocity matching at the
     /// offset distance. MechJeb picks this module up like its own (it scans all assemblies for
     /// ComputerModule types); the window starts and stops it through Users.
@@ -29,6 +36,7 @@ namespace MechJebTweaks.Rendezvous
         public enum Step
         {
             Idle,
+            RouteBurn,
             Circularize,
             MatchPlanes,
             Phasing,
@@ -61,6 +69,12 @@ namespace MechJebTweaks.Rendezvous
         private double _phasingRadius;
         /// <summary>Radius the circularization aims at (the chosen apsis, later the waiting orbit); NaN = not chosen yet.</summary>
         private double _aimRadius = double.NaN;
+        /// <summary>The route from the starting orbit, chosen at the first plan (ChooseRoute).</summary>
+        private bool _routeChosen;
+        private Route _route;
+        private bool _routeBurnDone;
+        private RouteKind? _pickedRoute;
+        private int _waitingRepicks;
         private bool _oldAutowarp;
 
         // The burn being executed: to tell a finished burn from a cancelled one.
@@ -134,9 +148,11 @@ namespace MechJebTweaks.Rendezvous
             return null;
         }
 
-        public void Start(object user, double distance)
+        /// <param name="route">The route the player picked in the window; null: the autopilot chooses (ChooseRoute).</param>
+        public void Start(object user, double distance, RouteKind? route)
         {
             _distance = Math.Max(1.0, distance);
+            _pickedRoute = route;
             Users.Add(user);
         }
 
@@ -163,6 +179,10 @@ namespace MechJebTweaks.Rendezvous
             _attempts = 0;
             _phasingRadius = 0;
             _aimRadius = double.NaN;
+            _routeChosen = false;
+            _route = default;
+            _routeBurnDone = false;
+            _waitingRepicks = 0;
             _rcsCommand = null;
             _controlsTaken = false;
             Failed = false;
@@ -276,6 +296,10 @@ namespace MechJebTweaks.Rendezvous
         {
             switch (Current)
             {
+                case Step.RouteBurn:
+                    _routeBurnDone = true;
+                    _needPlan = true;
+                    break;
                 case Step.Circularize:
                 case Step.MatchPlanes:
                 case Step.Phasing:
@@ -307,16 +331,72 @@ namespace MechJebTweaks.Rendezvous
             double ut;
             try
             {
-                if (orbit.eccentricity > Settings.RzRoundEccentricity)
+                if (!_routeChosen)
+                {
+                    // Once per run: the whole route from the starting orbit (see ChooseRoute).
+                    _routeChosen = true;
+                    if (orbit.eccentricity > Settings.RzRoundEccentricity || orbit.RelativeInclination(target) > Settings.RzPlaneAngle)
+                    {
+                        var all = new List<Route>();
+                        _route = ChooseRoute(orbit, target, now, MaxAcceleration(), all);
+                        string by = "chosen";
+                        if (_pickedRoute.HasValue && _pickedRoute.Value != _route.Kind)
+                        {
+                            int picked = all.FindIndex(r => r.Kind == _pickedRoute.Value);
+                            if (picked >= 0)
+                            {
+                                by = $"picked by the player (the autopilot's choice: {_route.Kind})";
+                                _route = all[picked];
+                            }
+                            else
+                                by = $"chosen (the player's pick {_pickedRoute.Value} is no longer possible)";
+                        }
+                        var others = new List<string>();
+                        foreach (Route r in all)
+                            if (r.Kind != _route.Kind)
+                                others.Add(RouteText(r, orbit.referenceBody));
+                        Log.Info($"rendezvous autopilot: route {RouteText(_route, orbit.referenceBody)} {by}" +
+                                 (others.Count > 0 ? $" over {string.Join("; ", others)}" : ""));
+                        if (_route.Kind == RouteKind.CircularizeAp)
+                            _aimRadius = orbit.ApR;
+                        else if (_route.Kind == RouteKind.CircularizePe)
+                            _aimRadius = orbit.PeR;
+                    }
+                }
+
+                // History (test 17, 2026-10-17): a 12-minute circularization at a waiting orbit 22 km above the target
+                // ended at 598 x 658 km; circularizing again at the nearer apsis left the vessel on a round orbit just
+                // below the target's, where it hardly drifts, and MechJeb's Hohmann transfer then wanted 722 m/s.
+                // Now a missed waiting orbit is chosen anew from the orbit actually reached.
+                if (_phasingRadius > 0 && (!_route.IsBurn || _routeBurnDone) && orbit.eccentricity <= Settings.RzRoundEccentricity
+                    && WaitingOrbitMissed(orbit.semiMajorAxis, _phasingRadius, target.semiMajorAxis))
+                {
+                    if (_waitingRepicks >= Settings.RzMaxAttempts)
+                    {
+                        Stop(Localizer.Format("#LOC_MJTweaks_RZ_AP_ErrRepeat", StepName(Step.Phasing), Settings.RzMaxAttempts), true);
+                        return;
+                    }
+                    _waitingRepicks++;
+                    Log.Info($"rendezvous autopilot: waiting orbit missed: at {(orbit.semiMajorAxis - orbit.referenceBody.Radius) / 1000:F1} km " +
+                             $"instead of {(_phasingRadius - orbit.referenceBody.Radius) / 1000:F1} km (target at " +
+                             $"{(target.semiMajorAxis - orbit.referenceBody.Radius) / 1000:F1} km), choosing it anew");
+                    _phasingRadius = 0;
+                }
+
+                if (_route.Valid && _route.IsBurn && !_routeBurnDone)
+                {
+                    // One burn to the waiting orbit; then rule 1 circularizes there, no other waiting orbit is picked.
+                    step = Step.RouteBurn;
+                    _aimRadius = _route.WaitingRadius;
+                    _phasingRadius = _route.WaitingRadius;
+                    ut = _route.BurnUT;
+                    dV = _route.BurnDv;
+                }
+                else if (orbit.eccentricity > Settings.RzRoundEccentricity)
                 {
                     step = Step.Circularize;
                     if (double.IsNaN(_aimRadius))
-                    {
-                        // First circularization: at the apsis whose whole route is better (see ChooseRoute).
-                        Route chosen = ChooseRoute(orbit, target, now, out Route other);
-                        _aimRadius = chosen.AtPeriapsis ? orbit.PeR : orbit.ApR;
-                        Log.Info($"rendezvous autopilot: route via {RouteText(chosen)} chosen over {RouteText(other)}");
-                    }
+                        _aimRadius = orbit.ApR;
                     ut = CircularizeUT(orbit, now);
                     dV = OrbitalManeuverCalculator.DeltaVToCircularize(orbit, ut);
                 }
@@ -329,7 +409,10 @@ namespace MechJebTweaks.Rendezvous
                         return;
                     }
                 }
-                else if (_phasingRadius <= 0 && NeedsPhasing(orbit.semiMajorAxis, target.semiMajorAxis) && PickWaitingOrbit(orbit, target, now))
+                else if (_phasingRadius <= 0
+                         && (NeedsPhasing(orbit.semiMajorAxis, target.semiMajorAxis)
+                             || BrakeTooLong(orbit.referenceBody.gravParameter, orbit.semiMajorAxis, target, MaxAcceleration()))
+                         && PickWaitingOrbit(orbit, target, now))
                 {
                     step = Step.Phasing;
                     if (_phasingRadius <= 0)
@@ -344,7 +427,7 @@ namespace MechJebTweaks.Rendezvous
                 else
                 {
                     step = Step.Hohmann;
-                    OffsetMath.Result hohmann = OffsetMath.HohmannWithOffset(orbit, target, now + BurnLead, _distance);
+                    OffsetMath.Result hohmann = PlanTransfer(orbit, target, now, out double brake);
                     if (!hohmann.Ok)
                     {
                         Stop(Localizer.Format("#LOC_MJTweaks_RZ_AP_ErrSolver", hohmann.Error ?? string.Empty), true);
@@ -352,6 +435,31 @@ namespace MechJebTweaks.Rendezvous
                     }
                     dV = hohmann.DeltaV;
                     ut = hohmann.UT;
+
+                    // MechJeb's transfer far dearer than the model (test 17: 722 m/s between almost equal orbits): refuse it.
+                    double mu = orbit.referenceBody.gravParameter;
+                    double expected = FirstBurn(mu, orbit.semiMajorAxis, target.semiMajorAxis)
+                                      + 2 * Math.Sqrt(mu / orbit.semiMajorAxis) * Math.Sin(0.5 * orbit.RelativeInclination(target) * Math.PI / 180);
+                    if (dV.magnitude > 1.5 * expected + 20)
+                    {
+                        Log.Warning($"rendezvous autopilot: transfer refused: MechJeb's Hohmann burn {dV.magnitude:F0} m/s, expected about {expected:F0} m/s");
+                        Stop(Localizer.Format("#LOC_MJTweaks_RZ_AP_ErrHohmannCostly", dV.magnitude.ToString("F0"), expected.ToString("F0")), true);
+                        return;
+                    }
+
+                    // Before the transfer, not after it (test 16): can one burn stop the vessel at the target?
+                    double accel = MaxAcceleration();
+                    if (accel > 0)
+                    {
+                        double seconds = BrakeSeconds(brake, accel);
+                        if (seconds > Settings.RzBrakeMaxOrbitShare * target.period)
+                        {
+                            Log.Warning($"rendezvous autopilot: transfer refused: braking {brake:F0} m/s would last {seconds:F0} s " +
+                                        $"({seconds / target.period:P0} of the target's orbit, at most {Settings.RzBrakeMaxOrbitShare:P0})");
+                            Stop(Localizer.Format("#LOC_MJTweaks_RZ_AP_ErrBrakeTooLong", brake.ToString("F0"), seconds.ToString("F0")), true);
+                            return;
+                        }
+                    }
                 }
             }
             catch (Exception e)
@@ -370,6 +478,57 @@ namespace MechJebTweaks.Rendezvous
             }
 
             Execute(step, orbit, dV, ut);
+        }
+
+        /// <summary>
+        /// The safe Hohmann transfer and the braking speed at its arrival. MechJeb's solver (TwoImpulseTransfer) is a
+        /// local optimizer started from the given time: between close orbits the window may be a day away, and from
+        /// "now" it settles on a dear fast transfer (test 19, 2026-10-17: 78 m/s instead of ~21 from a waiting orbit
+        /// 55 km above the target, window ~31 h off). So it is also started shortly before the window of the round-orbit
+        /// model, and the transfer with less dV plus braking is taken.
+        /// </summary>
+        private OffsetMath.Result PlanTransfer(Orbit orbit, Orbit target, double now, out double brake)
+        {
+            double mu = orbit.referenceBody.gravParameter;
+            var starts = new List<double> { now + BurnLead };
+            Vector3d position = orbit.getRelativePositionAtUT(now);
+            Vector3d normal = Vector3d.Cross(position, orbit.getOrbitalVelocityAtUT(now)).normalized;
+            double wait = WaitAndTransfer(mu, target, now, position, normal, orbit.semiMajorAxis, out _);
+            if (!double.IsNaN(wait) && wait - 0.25 * orbit.period > BurnLead)
+                starts.Add(now + wait - 0.25 * orbit.period);
+
+            OffsetMath.Result best = new OffsetMath.Result { Error = "no transfer found" };
+            brake = double.NaN;
+            foreach (double start in starts)
+            {
+                OffsetMath.Result r;
+                try
+                {
+                    r = OffsetMath.HohmannWithOffset(orbit, target, start, _distance);
+                }
+                catch (Exception e)
+                {
+                    r = new OffsetMath.Result { Error = e.Message };
+                }
+                if (!r.Ok)
+                {
+                    Log.Info($"rendezvous autopilot: transfer searched from {start - now:F0} s: failed ({r.Error})");
+                    if (!best.Ok)
+                        best.Error = r.Error;
+                    continue;
+                }
+                Orbit transfer = orbit.PerturbedOrbit(r.UT, r.DeltaV);
+                double arrival = transfer.NextClosestApproachTime(target, r.UT);
+                double speed = (transfer.WorldOrbitalVelocityAtUT(arrival) - target.WorldOrbitalVelocityAtUT(arrival)).magnitude;
+                Log.Info($"rendezvous autopilot: transfer searched from {start - now:F0} s: dV {r.DeltaV.magnitude:F1} m/s in {r.UT - now:F0} s, " +
+                         $"braking {speed:F1} m/s");
+                if (!best.Ok || r.DeltaV.magnitude + speed < best.DeltaV.magnitude + brake)
+                {
+                    best = r;
+                    brake = speed;
+                }
+            }
+            return best;
         }
 
         /// <summary>Circularize at the apsis nearest the aimed radius (the chosen apsis, or the waiting orbit).</summary>
@@ -402,6 +561,13 @@ namespace MechJebTweaks.Rendezvous
             return state.mass > 0 ? state.thrustAvailable / state.mass : 0;
         }
 
+        /// <summary>The round orbit reached is less than half as far from the target's as the waiting orbit meant to be, or on its other side.</summary>
+        private static bool WaitingOrbitMissed(double radius, double waitingRadius, double targetRadius)
+        {
+            double planned = waitingRadius - targetRadius;
+            return Math.Abs(planned) > 1 && (radius - targetRadius) / planned < 0.5;
+        }
+
         private static bool NeedsPhasing(double radius, double targetRadius) =>
             Math.Abs(radius / targetRadius - 1) < Settings.RzPhasingMinDifference;
 
@@ -423,7 +589,7 @@ namespace MechJebTweaks.Rendezvous
         /// </summary>
         private bool PickWaitingOrbit(Orbit orbit, Orbit target, double now)
         {
-            PhasingChoice choice = ChoosePhasing(orbit, target, now);
+            PhasingChoice choice = ChoosePhasing(orbit, target, now, MaxAcceleration());
             if (!choice.Chosen.Valid)
             {
                 _phasingRadius = 0;
@@ -471,7 +637,7 @@ namespace MechJebTweaks.Rendezvous
         /// actual phase of the target; the cheapest one that takes at most SlowFactor x as long as the
         /// PhasingRatio orbit is taken.
         /// </summary>
-        public static PhasingChoice ChoosePhasing(Orbit orbit, Orbit target, double now)
+        public static PhasingChoice ChoosePhasing(Orbit orbit, Orbit target, double now, double accel)
         {
             CelestialBody body = orbit.referenceBody;
             double burnUT = now + BurnLead;
@@ -479,9 +645,9 @@ namespace MechJebTweaks.Rendezvous
             var choice = new PhasingChoice();
 
             double standard = PhasingRadius(target);
-            choice.Baseline = standard > 0 ? PlanPhasing(orbit, target, now, burnUT, standard, false) : default;
+            choice.Baseline = standard > 0 ? PlanPhasing(orbit, target, now, burnUT, standard, false, accel) : default;
 
-            var plans = new System.Collections.Generic.List<PhasingPlan> { PlanPhasing(orbit, target, now, now, orbit.semiMajorAxis, true) };
+            var plans = new List<PhasingPlan> { PlanPhasing(orbit, target, now, now, orbit.semiMajorAxis, true, accel) };
             if (choice.Baseline.Valid)
                 plans.Add(choice.Baseline);
             double step = Math.Max(0.001, Settings.RzPhasingStep);
@@ -489,10 +655,10 @@ namespace MechJebTweaks.Rendezvous
             {
                 double above = targetRadius * (1 + share);
                 if (above < 0.9 * body.sphereOfInfluence)
-                    plans.Add(PlanPhasing(orbit, target, now, burnUT, above, false));
+                    plans.Add(PlanPhasing(orbit, target, now, burnUT, above, false, accel));
                 double below = targetRadius / (1 + share);
                 if (below >= LowestRadius(body))
-                    plans.Add(PlanPhasing(orbit, target, now, burnUT, below, false));
+                    plans.Add(PlanPhasing(orbit, target, now, burnUT, below, false, accel));
             }
 
             double fastest = double.MaxValue;
@@ -515,7 +681,7 @@ namespace MechJebTweaks.Rendezvous
         /// own orbit without the first transfer. Invalid when a burn would be too small to execute reliably or
         /// the target never drifts relative to us.
         /// </summary>
-        private static PhasingPlan PlanPhasing(Orbit orbit, Orbit target, double now, double burnUT, double radius, bool direct)
+        private static PhasingPlan PlanPhasing(Orbit orbit, Orbit target, double now, double burnUT, double radius, bool direct, double accel)
         {
             double mu = orbit.referenceBody.gravParameter;
             double ours = orbit.semiMajorAxis;
@@ -525,6 +691,12 @@ namespace MechJebTweaks.Rendezvous
             if (FirstBurn(mu, ours, direct ? targetRadius : radius) < MinPlanBurn)
                 return plan;
             if (!direct && FirstBurn(mu, radius, targetRadius) < MinPlanBurn)
+                return plan;
+            if (BrakeTooLong(mu, direct ? ours : radius, target, accel))
+                return plan;
+            // Circularizing at the waiting orbit: the second burn of the Hohmann transfer from our orbit to it.
+            if (!direct && TooCloseForCircularization(mu, radius, targetRadius,
+                    Math.Abs(Math.Sqrt(mu / radius) * (1 - Math.Sqrt(2 * ours / (ours + radius)))), accel))
                 return plan;
 
             // How far the target is ahead of us along our direction of motion at burnUT, 0..2 pi.
@@ -544,19 +716,77 @@ namespace MechJebTweaks.Rendezvous
                 dv += Hohmann(mu, ours, radius);
             }
 
-            double waitRate = Math.Sqrt(mu / (radius * radius * radius));
-            double transfer = HalfTransfer(mu, radius, targetRadius);
-            double needed = Math.PI - targetRate * transfer;
-            double drift = targetRate - waitRate;
-            if (Math.Abs(drift) < 1e-12)
+            double wait = WaitForWindow(mu, target, radius, ahead, out double transfer);
+            if (double.IsNaN(wait))
                 return plan;
-            double wait = drift > 0 ? Mod2Pi(needed - ahead) / drift : Mod2Pi(ahead - needed) / -drift;
 
             plan.Valid = true;
             plan.DeltaV = dv + Hohmann(mu, radius, targetRadius);
             plan.Seconds = seconds + wait + transfer;
             return plan;
         }
+
+        /// <summary>
+        /// On a round orbit of <paramref name="radius"/> in the target's plane with the target <paramref name="ahead"/>
+        /// radians ahead: the wait until a Hohmann transfer meets the target, and that transfer's time. NaN when the
+        /// target does not drift relative to us.
+        /// </summary>
+        private static double WaitForWindow(double mu, Orbit target, double radius, double ahead, out double transfer)
+        {
+            double targetRate = 2 * Math.PI / target.period;
+            double waitRate = Math.Sqrt(mu / (radius * radius * radius));
+            transfer = HalfTransfer(mu, radius, target.semiMajorAxis);
+            double needed = Math.PI - targetRate * transfer;
+            double drift = targetRate - waitRate;
+            if (Math.Abs(drift) < 1e-12)
+                return double.NaN;
+            return drift > 0 ? Mod2Pi(needed - ahead) / drift : Mod2Pi(ahead - needed) / -drift;
+        }
+
+        /// <summary>WaitForWindow from our position at ut, moving as for <paramref name="normal"/>.</summary>
+        private static double WaitAndTransfer(double mu, Orbit target, double ut, Vector3d position, Vector3d normal, double radius, out double transfer)
+        {
+            Vector3d targetPosition = target.getRelativePositionAtUT(ut);
+            double ahead = Math.Atan2(Vector3d.Dot(normal, Vector3d.Cross(position, targetPosition)), Vector3d.Dot(position, targetPosition));
+            return WaitForWindow(mu, target, radius, ahead, out transfer);
+        }
+
+        /// <summary>
+        /// Braking on arrival of a Hohmann transfer from radius r1 would last more than Settings.RzBrakeMaxOrbitShare of
+        /// the target's period at BurnThrottle: one burn then curves far off the approach line. Unknown thrust: false.
+        /// </summary>
+        private static bool BrakeTooLong(double mu, double r1, Orbit target, double accel)
+        {
+            if (!(accel > 0))
+                return false;
+            double r2 = target.semiMajorAxis;
+            double arrival = Math.Abs(Math.Sqrt(mu / r2) * (1 - Math.Sqrt(2 * r1 / (r1 + r2))));
+            return BrakeSeconds(arrival, accel) > Settings.RzBrakeMaxOrbitShare * target.period;
+        }
+
+        private static double BrakeSeconds(double dv, double accel) => dv / (Settings.RzBurnThrottle * accel);
+
+        /// <summary>
+        /// A long circularization at the waiting orbit misses it (tests 17-18: 1336 m/s at 1.8 m/s², 12 min, ended at
+        /// 598 x 658 km instead of 627 km round). A simulation of MechJeb's node executor (start half the burn early,
+        /// thrust along the remaining burn vector) reproduced it (604 x 652 km) and gave miss ≈ 0.0085 r (n T)³, n the
+        /// waiting orbit's mean motion, T the burn time at full thrust. A waiting orbit is refused unless its distance
+        /// from the target's orbit is at least Settings.RzWaitingMissMargin such misses (2 would only just keep the
+        /// vessel out of WaitingOrbitMissed). Unknown thrust: never refused.
+        /// </summary>
+        private static bool TooCloseForCircularization(double mu, double radius, double targetRadius, double circularizeDv, double accel)
+        {
+            if (!(accel > 0))
+                return false;
+            double turned = Math.Sqrt(mu / (radius * radius * radius)) * circularizeDv / accel;
+            double miss = CircularizeMissShare * radius * turned * turned * turned;
+            return Math.Abs(radius - targetRadius) < Settings.RzWaitingMissMargin * miss;
+        }
+
+        private const double CircularizeMissShare = 0.0085;
+
+        /// <summary>Below this relative inclination (degrees) the nodes are ill-defined and not offered as burn points.</summary>
+        private const double MinNodeAngle = 0.05;
 
         /// <summary>Smallest first burn of a planned transfer: smaller ones are hard to execute and to tell from a cancelled node, m/s.</summary>
         private const double MinPlanBurn = 2.0;
@@ -595,7 +825,7 @@ namespace MechJebTweaks.Rendezvous
             NextEventUT = ut;
             Log.Info($"rendezvous autopilot: {step}{(_attempts > 1 ? $" (attempt {_attempts})" : "")}: dV {dV.magnitude:F1} m/s " +
                      $"in {ut - Planetarium.GetUniversalTime():F0} s; ours {OrbitText(orbit)}" +
-                     (step == Step.Phasing ? $", waiting orbit at {(_phasingRadius - orbit.referenceBody.Radius) / 1000:F1} km" : ""));
+                     (step == Step.Phasing || step == Step.RouteBurn ? $", waiting orbit at {(_phasingRadius - orbit.referenceBody.Radius) / 1000:F1} km" : ""));
         }
 
         // ---------------------------------------------------------------- transfer and correction
@@ -1372,6 +1602,7 @@ namespace MechJebTweaks.Rendezvous
         {
             switch (step)
             {
+                case Step.RouteBurn: return Localizer.Format("#LOC_MJTweaks_RZ_AP_StepRouteBurn");
                 case Step.Circularize: return Localizer.Format("#LOC_MJTweaks_RZ_AP_StepCircularize");
                 case Step.MatchPlanes: return Localizer.Format("#LOC_MJTweaks_RZ_AP_StepPlanes");
                 case Step.Phasing: return Localizer.Format("#LOC_MJTweaks_RZ_AP_StepPhasing");
@@ -1386,16 +1617,35 @@ namespace MechJebTweaks.Rendezvous
         private static string OrbitText(Orbit o) =>
             $"{o.PeA / 1000:F1} x {o.ApA / 1000:F1} km (e {o.eccentricity:F4})";
 
+        public enum RouteKind
+        {
+            /// <summary>The orbit is round already: the step rules alone (planes, waiting orbit, Hohmann).</summary>
+            Round,
+            /// <summary>Circularize at apoapsis first, then the step rules.</summary>
+            CircularizeAp,
+            /// <summary>Circularize at periapsis first, then the step rules.</summary>
+            CircularizePe,
+            /// <summary>One burn at a node with the target's plane: plane turned, the opposite apsis at a waiting orbit.</summary>
+            AscendingNode,
+            DescendingNode,
+            /// <summary>Planes close already: one burn at an apsis puts the opposite apsis at a waiting orbit.</summary>
+            ApoapsisBurn,
+            PeriapsisBurn
+        }
+
         /// <summary>A whole route estimated in advance: total dV and time until the velocities are matched.</summary>
         public struct Route
         {
             public bool Valid;
-            /// <summary>The first circularization is at periapsis (false: at apoapsis, or the orbit is already round).</summary>
-            public bool AtPeriapsis;
-            /// <summary>The orbit is round already, there is no choice of apsis.</summary>
-            public bool Round;
+            public RouteKind Kind;
             public double DeltaV;
             public double Seconds;
+            /// <summary>Burn routes: the first burn (world dV), and the waiting orbit it heads for.</summary>
+            public double BurnUT;
+            public Vector3d BurnDv;
+            public double WaitingRadius;
+
+            public bool IsBurn => Kind >= RouteKind.AscendingNode;
         }
 
         /// <summary>
@@ -1405,11 +1655,11 @@ namespace MechJebTweaks.Rendezvous
         /// Invalid when that apsis cannot be used: periapsis too low for a circular orbit, apoapsis outside
         /// the sphere of influence.
         /// </summary>
-        public static Route PlanRoute(Orbit orbit, Orbit target, double now, bool atPeriapsis)
+        public static Route PlanRoute(Orbit orbit, Orbit target, double now, bool atPeriapsis, double accel)
         {
             CelestialBody body = orbit.referenceBody;
             double mu = body.gravParameter;
-            var route = new Route { AtPeriapsis = atPeriapsis };
+            var route = new Route { Kind = atPeriapsis ? RouteKind.CircularizePe : RouteKind.CircularizeAp };
             double dv = 0;
             double seconds = 0;
 
@@ -1436,22 +1686,24 @@ namespace MechJebTweaks.Rendezvous
                 }
             }
             else
-                route.Round = true;
+                route.Kind = RouteKind.Round;
 
             double inclination = orbit.RelativeInclination(target);
+            double targetRadius = target.semiMajorAxis;
             if (inclination > Settings.RzPlaneAngle)
             {
                 dv += 2 * Math.Sqrt(mu / radius) * Math.Sin(0.5 * inclination * Math.PI / 180);
                 seconds += 0.25 * Period(mu, radius);
             }
+            else // left for the transfer, paid at the target's speed
+                dv += 2 * Math.Sqrt(mu / targetRadius) * Math.Sin(0.5 * inclination * Math.PI / 180);
 
-            double targetRadius = target.semiMajorAxis;
-            if (NeedsPhasing(radius, targetRadius))
+            if (NeedsPhasing(radius, targetRadius) || BrakeTooLong(mu, radius, target, accel))
             {
                 // Round orbit in the target's plane: the autopilot's own choice, timed from the actual phase.
-                if (route.Round && inclination <= Settings.RzPlaneAngle)
+                if (route.Kind == RouteKind.Round && inclination <= Settings.RzPlaneAngle)
                 {
-                    PhasingChoice choice = ChoosePhasing(orbit, target, now);
+                    PhasingChoice choice = ChoosePhasing(orbit, target, now, accel);
                     if (choice.Chosen.Valid)
                     {
                         route.Valid = true;
@@ -1483,37 +1735,220 @@ namespace MechJebTweaks.Rendezvous
         }
 
         /// <summary>
-        /// For an eccentric orbit: the route via the apsis with less dV, unless it takes more than
-        /// Settings.RzSlowFactor times longer while the faster one costs at most Settings.RzDvMargin more.
-        /// For a round orbit the only route (other is invalid).
+        /// All routes from the current orbit (the valid ones go to <paramref name="all"/>) and the chosen one: the
+        /// cheapest, unless it takes more than Settings.RzSlowFactor times longer than the fastest while the
+        /// fastest costs at most Settings.RzDvMargin more. Candidates: circularize at either apsis (eccentric
+        /// orbit) or nothing first (round orbit); planes apart: one burn at either node to a waiting orbit;
+        /// eccentric with planes close: one burn at either apsis to a waiting orbit. accel: full thrust / mass,
+        /// 0 when unknown (no check of the final braking).
+        /// History (test 16, 2026-10-17): from 3028 x 93 440 km, planes 36.4° apart, the autopilot circularized at
+        /// apoapsis (357 m/s, raising the periapsis to 93 440 km), matched planes there (321 m/s) and went down
+        /// again with a Hohmann transfer (405 m/s) straight onto the target: 1343 m/s of braking at 1.8 m/s²,
+        /// which it refused only after the transfer. One burn at the high node (≈ 94 m/s) to a waiting orbit next
+        /// to the target, then circularize there, saves ≈ 1000 m/s and leaves tens of m/s of braking.
         /// </summary>
-        public static Route ChooseRoute(Orbit orbit, Orbit target, double now, out Route other)
+        public static Route ChooseRoute(Orbit orbit, Orbit target, double now, double accel, List<Route> all)
         {
-            Route apoapsis = PlanRoute(orbit, target, now, false);
-            if (apoapsis.Round)
+            all?.Clear();
+            var candidates = new List<Route>();
+            Route apoapsis = PlanRoute(orbit, target, now, false, accel);
+            candidates.Add(apoapsis);
+            bool round = apoapsis.Kind == RouteKind.Round;
+            if (!round)
+                candidates.Add(PlanRoute(orbit, target, now, true, accel));
+
+            // Node burns whenever the planes differ at all on an eccentric orbit: high up even a few degrees cost little,
+            // while left for the low orbit 5° cost ~290 m/s (test 22 setup, 2026-10-17). Apsis burns keep our plane.
+            double inclination = orbit.RelativeInclination(target);
+            if (inclination > Settings.RzPlaneAngle || (!round && inclination > MinNodeAngle))
             {
-                other = default;
-                return apoapsis;
+                if (orbit.AscendingNodeExists(target))
+                    candidates.Add(PlanBurnRoute(orbit, target, now, RouteKind.AscendingNode, accel));
+                if (orbit.DescendingNodeExists(target))
+                    candidates.Add(PlanBurnRoute(orbit, target, now, RouteKind.DescendingNode, accel));
             }
-            Route periapsis = PlanRoute(orbit, target, now, true);
-            if (!periapsis.Valid || !apoapsis.Valid)
+            if (!round && inclination <= Settings.RzPlaneAngle)
             {
-                other = periapsis.Valid ? apoapsis : periapsis;
-                return periapsis.Valid ? periapsis : apoapsis;
+                candidates.Add(PlanBurnRoute(orbit, target, now, RouteKind.ApoapsisBurn, accel));
+                candidates.Add(PlanBurnRoute(orbit, target, now, RouteKind.PeriapsisBurn, accel));
             }
 
-            Route cheap = apoapsis.DeltaV <= periapsis.DeltaV ? apoapsis : periapsis;
-            Route fast = apoapsis.Seconds <= periapsis.Seconds ? apoapsis : periapsis;
-            Route chosen = cheap.Seconds > Settings.RzSlowFactor * fast.Seconds
-                           && fast.DeltaV - cheap.DeltaV <= Settings.RzDvMargin * cheap.DeltaV
+            Route cheap = default, fast = default;
+            foreach (Route r in candidates)
+            {
+                if (!r.Valid)
+                    continue;
+                all?.Add(r);
+                if (!cheap.Valid || r.DeltaV < cheap.DeltaV)
+                    cheap = r;
+                if (!fast.Valid || r.Seconds < fast.Seconds)
+                    fast = r;
+            }
+            if (!cheap.Valid)
+                return default;
+            return cheap.Seconds > Settings.RzSlowFactor * fast.Seconds
+                   && fast.DeltaV - cheap.DeltaV <= Settings.RzDvMargin * cheap.DeltaV
                 ? fast
                 : cheap;
-            other = chosen.AtPeriapsis ? apoapsis : periapsis;
-            return chosen;
         }
 
-        private static string RouteText(Route r) =>
-            !r.Valid ? "(unusable apsis)" : $"{(r.Round ? "round orbit" : r.AtPeriapsis ? "periapsis" : "apoapsis")}: dV {r.DeltaV:F0} m/s, {r.Seconds / 3600:F1} h";
+        /// <summary>
+        /// One burn at the node (or apsis) of <paramref name="kind"/> that leaves the orbit in the target's plane
+        /// (at a node; at an apsis: in our own plane) with the opposite apsis at a waiting radius next to the target;
+        /// then circularize there, wait for the transfer window, Hohmann to the target. The waiting radius is chosen
+        /// as in ChoosePhasing: candidates up to PhasingRatio above and below, the cheapest taking at most
+        /// SlowFactor x as long as the PhasingRatio orbit. Analytic two-body model.
+        /// </summary>
+        public static Route PlanBurnRoute(Orbit orbit, Orbit target, double now, RouteKind kind, double accel)
+        {
+            var best = new Route { Kind = kind };
+            if (orbit.eccentricity >= 1)
+                return best;
+            CelestialBody body = orbit.referenceBody;
+            double mu = body.gravParameter;
+            double targetRadius = target.semiMajorAxis;
+
+            double start = now + BurnLead;
+            double ut;
+            switch (kind)
+            {
+                case RouteKind.AscendingNode: ut = orbit.TimeOfAscendingNode(target, start); break;
+                case RouteKind.DescendingNode: ut = orbit.TimeOfDescendingNode(target, start); break;
+                case RouteKind.ApoapsisBurn: ut = orbit.NextApoapsisTime(start); break;
+                default: ut = orbit.NextPeriapsisTime(start); break;
+            }
+            if (double.IsNaN(ut) || ut < start)
+                return best;
+
+            Vector3d targetNormal = Vector3d.Cross(target.getRelativePositionAtUT(now), target.getOrbitalVelocityAtUT(now)).normalized;
+            Vector3d normal = kind == RouteKind.AscendingNode || kind == RouteKind.DescendingNode
+                ? targetNormal
+                : Vector3d.Cross(orbit.getRelativePositionAtUT(now), orbit.getOrbitalVelocityAtUT(now)).normalized;
+            Vector3d position = orbit.getRelativePositionAtUT(ut);
+            Vector3d velocity = orbit.getOrbitalVelocityAtUT(ut);
+            // An apsis burn leaves the planes apart; that is paid on the low orbit (x circular speed there).
+            double leftPlaneCost = kind == RouteKind.ApoapsisBurn || kind == RouteKind.PeriapsisBurn
+                ? 2 * Math.Sin(0.5 * orbit.RelativeInclination(target) * Math.PI / 180)
+                : 0;
+
+            Route Candidate(double radius)
+            {
+                var r = new Route { Kind = kind, WaitingRadius = radius };
+                if (FirstBurn(mu, radius, targetRadius) < MinPlanBurn || BrakeTooLong(mu, radius, target, accel))
+                    return r;
+                if (!ApsisBurn(mu, position, velocity, normal, radius, out Vector3d after, out double apsisSpeed))
+                    return r;
+                if (TooCloseForCircularization(mu, radius, targetRadius, Math.Abs(apsisSpeed - Math.Sqrt(mu / radius)), accel))
+                    return r;
+
+                // The orbit after the burn: the other apsis must stay inside the sphere of influence and above the surface.
+                double distance = position.magnitude;
+                double energy = 0.5 * after.sqrMagnitude - mu / distance;
+                if (energy >= 0)
+                    return r;
+                double sma = -mu / (2 * energy);
+                double other = 2 * sma - radius;
+                if (Math.Max(other, radius) > 0.9 * body.sphereOfInfluence || Math.Min(other, radius) < LowestRadius(body))
+                    return r;
+
+                if (!TimeToApsis(mu, position, after, radius < distance, out double toApsis, out Vector3d apsis))
+                    return r;
+                double arrive = ut + toApsis;
+                double wait = WaitAndTransfer(mu, target, arrive, apsis.normalized * radius, normal, radius, out double transfer);
+                if (double.IsNaN(wait))
+                    return r;
+
+                r.Valid = true;
+                r.BurnUT = ut;
+                r.BurnDv = (after - velocity).xzy;
+                r.DeltaV = (after - velocity).magnitude + Math.Abs(apsisSpeed - Math.Sqrt(mu / radius)) + Hohmann(mu, radius, targetRadius)
+                           + leftPlaneCost * Math.Sqrt(mu / radius);
+                r.Seconds = arrive - now + wait + transfer;
+                return r;
+            }
+
+            double standard = PhasingRadius(target);
+            Route baseline = standard > 0 ? Candidate(standard) : default;
+            var plans = new List<Route>();
+            if (baseline.Valid)
+                plans.Add(baseline);
+            double step = Math.Max(0.001, Settings.RzPhasingStep);
+            for (double share = step; share < Settings.RzPhasingRatio - 1 + 0.5 * step; share += step)
+            {
+                double above = targetRadius * (1 + share);
+                if (above < 0.9 * body.sphereOfInfluence)
+                    plans.Add(Candidate(above));
+                double below = targetRadius / (1 + share);
+                if (below >= LowestRadius(body))
+                    plans.Add(Candidate(below));
+            }
+
+            double fastest = double.MaxValue;
+            foreach (Route p in plans)
+                if (p.Valid)
+                    fastest = Math.Min(fastest, p.Seconds);
+            double budget = Settings.RzSlowFactor * (baseline.Valid ? baseline.Seconds : fastest);
+            foreach (Route p in plans)
+                if (p.Valid && p.Seconds <= budget && (!best.Valid || p.DeltaV < best.DeltaV))
+                    best = p;
+            return best;
+        }
+
+        /// <summary>
+        /// The velocity after a burn at <paramref name="position"/> that keeps the radial speed, turns the horizontal
+        /// one into the plane with <paramref name="normal"/> (the direction of motion as for that normal) and sizes it
+        /// so the orbit has an apsis at <paramref name="radius"/> (energy and angular momentum: at an apsis the speed
+        /// is horizontal). False when no such orbit exists (radial speed alone carries past the radius).
+        /// </summary>
+        private static bool ApsisBurn(double mu, Vector3d position, Vector3d velocity, Vector3d normal, double radius,
+            out Vector3d after, out double apsisSpeed)
+        {
+            after = velocity;
+            apsisSpeed = 0;
+            double distance = position.magnitude;
+            Vector3d up = position / distance;
+            double radial = Vector3d.Dot(velocity, up);
+            double ratio = radius / distance;
+            if (Math.Abs(1 - ratio) < 1e-6)
+                return false;
+            double squared = (radial * radial + 2 * mu * (1 / radius - 1 / distance)) / (1 - ratio * ratio);
+            if (!(squared > 0))
+                return false;
+            apsisSpeed = Math.Sqrt(squared);
+            Vector3d horizontal = Vector3d.Cross(normal, up).normalized;
+            after = radial * up + ratio * apsisSpeed * horizontal;
+            return true;
+        }
+
+        /// <summary>Time from (position, velocity) to the periapsis (or apoapsis) and where it is. False for a round or open orbit.</summary>
+        private static bool TimeToApsis(double mu, Vector3d position, Vector3d velocity, bool periapsis, out double seconds, out Vector3d apsis)
+        {
+            seconds = 0;
+            apsis = Vector3d.zero;
+            double distance = position.magnitude;
+            Vector3d eccentricity = ((velocity.sqrMagnitude - mu / distance) * position - Vector3d.Dot(position, velocity) * velocity) / mu;
+            double e = eccentricity.magnitude;
+            double energy = 0.5 * velocity.sqrMagnitude - mu / distance;
+            if (e < 1e-6 || e >= 1 || energy >= 0)
+                return false;
+            double sma = -mu / (2 * energy);
+            Vector3d toPeriapsis = eccentricity / e;
+
+            double cosNu = Math.Max(-1, Math.Min(1, Vector3d.Dot(toPeriapsis, position) / distance));
+            double nu = Math.Acos(cosNu);
+            if (Vector3d.Dot(position, velocity) < 0)
+                nu = -nu;
+            double ecc = 2 * Math.Atan(Math.Sqrt((1 - e) / (1 + e)) * Math.Tan(0.5 * nu));
+            double mean = ecc - e * Math.Sin(ecc);
+            double motion = Math.Sqrt(mu / (sma * sma * sma));
+            seconds = Mod2Pi((periapsis ? 0 : Math.PI) - mean) / motion;
+            apsis = periapsis ? sma * (1 - e) * toPeriapsis : -sma * (1 + e) * toPeriapsis;
+            return true;
+        }
+
+        private static string RouteText(Route r, CelestialBody body) =>
+            !r.Valid ? "(none)"
+            : $"{r.Kind}{(r.IsBurn ? $" to waiting orbit {(r.WaitingRadius - body.Radius) / 1000:F0} km" : "")}: dV {r.DeltaV:F0} m/s, {r.Seconds / 3600:F1} h";
 
         private static double Period(double mu, double radius) => 2 * Math.PI * Math.Sqrt(radius * radius * radius / mu);
 

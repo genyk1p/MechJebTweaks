@@ -29,6 +29,16 @@ namespace MechJebTweaks.Rendezvous
         private static GUIStyle _red;
         private static GUIStyle _green;
 
+        private static GUIStyle _routeToggle;
+        private static GUIStyle _routeToggleRed;
+        private static GUIStyle _routeToggleGreen;
+
+        private readonly List<SafeRendezvousAutopilot.Route> _routes = new List<SafeRendezvousAutopilot.Route>();
+        private SafeRendezvousAutopilot.Route _chosenRoute;
+        private float _routesUntil;
+        /// <summary>The route the player picked in the list; null: the autopilot's own choice.</summary>
+        private SafeRendezvousAutopilot.RouteKind? _pickedRoute;
+
         public RendezvousOffsetWindow(MechJebCore core) : base(core)
         {
             Hidden = !Settings.RendezvousOffsetEnabled;
@@ -178,24 +188,35 @@ namespace MechJebTweaks.Rendezvous
                 GUILayout.Label(reason, _red);
             else
             {
-                // Both routes from an eccentric orbit, the one the autopilot would take marked.
-                SafeRendezvousAutopilot.Route chosen = SafeRendezvousAutopilot.ChooseRoute(Vessel.orbit, Core.Target.TargetOrbit, now, out SafeRendezvousAutopilot.Route other);
-                double available = Vessel.VesselDeltaV != null ? Vessel.VesselDeltaV.TotalDeltaVVac : double.NaN;
-                if (chosen.Round)
-                    RouteLine("#LOC_MJTweaks_RZ_AP_Route", chosen, false, available);
-                else
+                // Every route the autopilot considers, the one it would take marked. Recomputed twice a second
+                // (a few hundred candidates), and only in the layout pass so both GUI passes draw the same lines.
+                if (Event.current.type == EventType.Layout && Time.realtimeSinceStartup >= _routesUntil)
                 {
-                    RouteLine(chosen.AtPeriapsis ? "#LOC_MJTweaks_RZ_AP_RoutePe" : "#LOC_MJTweaks_RZ_AP_RouteAp", chosen, true, available);
-                    if (other.Valid)
-                        RouteLine(other.AtPeriapsis ? "#LOC_MJTweaks_RZ_AP_RoutePe" : "#LOC_MJTweaks_RZ_AP_RouteAp", other, false, available);
+                    _routesUntil = Time.realtimeSinceStartup + 0.5f;
+                    VesselState state = Core.VesselState;
+                    double accel = state.mass > 0 ? state.thrustAvailable / state.mass : 0;
+                    _chosenRoute = SafeRendezvousAutopilot.ChooseRoute(Vessel.orbit, Core.Target.TargetOrbit, now, accel, _routes);
+                    // A picked route that is no longer offered (the orbit or the target changed) falls back to the autopilot's choice.
+                    if (_pickedRoute.HasValue && !_routes.Exists(r => r.Kind == _pickedRoute.Value))
+                        _pickedRoute = null;
                 }
+                double available = Vessel.VesselDeltaV != null ? Vessel.VesselDeltaV.TotalDeltaVVac : double.NaN;
+                if (_routes.Count > 1)
+                {
+                    GUILayout.Label(Localizer.Format("#LOC_MJTweaks_RZ_AP_PickHint"));
+                    foreach (SafeRendezvousAutopilot.Route route in _routes)
+                        RouteToggleLine(route, available);
+                }
+                else
+                    foreach (SafeRendezvousAutopilot.Route route in _routes)
+                        GUILayout.Label(RouteText(route), available < route.DeltaV ? _red : GUI.skin.label);
                 GUILayout.Label(Localizer.Format("#LOC_MJTweaks_RZ_AP_VesselDv", double.IsNaN(available) ? "?" : available.ToString("F0")));
             }
 
             GUI.enabled = reason == null;
             if (GUILayout.Button(Localizer.Format("#LOC_MJTweaks_RZ_AP_StartButton"), GUILayout.Height(30f)))
             {
-                autopilot.Start(this, OffsetDistance.Val);
+                autopilot.Start(this, OffsetDistance.Val, _routes.Count > 1 ? _pickedRoute : null);
                 _status = string.Empty;
             }
             GUI.enabled = true;
@@ -203,13 +224,39 @@ namespace MechJebTweaks.Rendezvous
             return false;
         }
 
-        /// <summary>One estimated route: dV and time; red when the vessel has less dV than that (game's own figure).</summary>
-        private void RouteLine(string key, SafeRendezvousAutopilot.Route route, bool chosen, double available)
+        /// <summary>
+        /// One estimated route as a radio button: ticked when it is the one the autopilot will fly (the player's pick,
+        /// else the autopilot's own choice, marked as recommended); red when the vessel has less dV than that
+        /// (game's own figure). Ticking the recommended one goes back to the autopilot's choice.
+        /// </summary>
+        private void RouteToggleLine(SafeRendezvousAutopilot.Route route, double available)
         {
-            string text = Localizer.Format(key, route.DeltaV.ToString("F0"), GuiUtils.TimeToDHMS(route.Seconds));
-            if (chosen)
+            bool recommended = route.Kind == _chosenRoute.Kind;
+            bool ticked = _pickedRoute.HasValue ? route.Kind == _pickedRoute.Value : recommended;
+            string text = RouteText(route);
+            if (recommended)
                 text += Localizer.Format("#LOC_MJTweaks_RZ_AP_Chosen");
-            GUILayout.Label(text, available < route.DeltaV ? _red : chosen ? _green : GUI.skin.label);
+            GUIStyle style = available < route.DeltaV ? _routeToggleRed : ticked ? _routeToggleGreen : _routeToggle;
+            if (GUILayout.Toggle(ticked, text, style) && !ticked)
+                _pickedRoute = recommended ? (SafeRendezvousAutopilot.RouteKind?)null : route.Kind;
+        }
+
+        /// <summary>One estimated route: its name, dV, time and waiting orbit.</summary>
+        private string RouteText(SafeRendezvousAutopilot.Route route)
+        {
+            string key;
+            switch (route.Kind)
+            {
+                case SafeRendezvousAutopilot.RouteKind.CircularizeAp: key = "#LOC_MJTweaks_RZ_AP_RouteAp"; break;
+                case SafeRendezvousAutopilot.RouteKind.CircularizePe: key = "#LOC_MJTweaks_RZ_AP_RoutePe"; break;
+                case SafeRendezvousAutopilot.RouteKind.AscendingNode: key = "#LOC_MJTweaks_RZ_AP_RouteAN"; break;
+                case SafeRendezvousAutopilot.RouteKind.DescendingNode: key = "#LOC_MJTweaks_RZ_AP_RouteDN"; break;
+                case SafeRendezvousAutopilot.RouteKind.ApoapsisBurn: key = "#LOC_MJTweaks_RZ_AP_RouteApBurn"; break;
+                case SafeRendezvousAutopilot.RouteKind.PeriapsisBurn: key = "#LOC_MJTweaks_RZ_AP_RoutePeBurn"; break;
+                default: key = "#LOC_MJTweaks_RZ_AP_Route"; break;
+            }
+            return Localizer.Format(key, route.DeltaV.ToString("F0"), GuiUtils.TimeToDHMS(route.Seconds),
+                ((route.WaitingRadius - Vessel.mainBody.Radius) / 1000).ToString("F0"));
         }
 
         private void DrawExecuteControls()
@@ -375,6 +422,20 @@ namespace MechJebTweaks.Rendezvous
 
             _red = new GUIStyle(GUI.skin.label) { normal = { textColor = new Color(1f, 0.35f, 0.3f) } };
             _green = new GUIStyle(GUI.skin.label) { normal = { textColor = new Color(0.4f, 1f, 0.4f) } };
+            _routeToggle = RouteToggle(GUI.skin.toggle.normal.textColor);
+            _routeToggleRed = RouteToggle(_red.normal.textColor);
+            _routeToggleGreen = RouteToggle(_green.normal.textColor);
+        }
+
+        /// <summary>A wrapping toggle with one text colour in every state.</summary>
+        private static GUIStyle RouteToggle(Color color)
+        {
+            var style = new GUIStyle(GUI.skin.toggle) { wordWrap = true };
+            style.normal.textColor = style.onNormal.textColor = color;
+            style.hover.textColor = style.onHover.textColor = color;
+            style.active.textColor = style.onActive.textColor = color;
+            style.focused.textColor = style.onFocused.textColor = color;
+            return style;
         }
     }
 }

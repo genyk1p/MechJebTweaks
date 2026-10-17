@@ -122,6 +122,19 @@ namespace MechJebTweaks
         public static double RzBurnMaxLateral = 2000;
 
         /// <summary>
+        /// Route planning: a transfer straight to the target is not used when its braking at BurnThrottle would last
+        /// more than this share of the target's orbital period (the burn curves off the approach line); the route
+        /// goes via a waiting orbit next to the target instead. Tests: 8.6 % ended 0.8 km aside (fine), 21 % 34 km.
+        /// </summary>
+        public static double RzBrakeMaxOrbitShare = 0.12;
+
+        /// <summary>
+        /// A waiting orbit is at least this many expected circularization misses away from the target's orbit (a long
+        /// burn of a weak engine ends tens of km off; see SafeRendezvousAutopilot.TooCloseForCircularization).
+        /// </summary>
+        public static double RzWaitingMissMargin = 3;
+
+        /// <summary>
         /// Sideways RCS nudges during the burn: wanted end point BurnLateralShare x offset aside of the target;
         /// a nudge when the plan misses that by more than NudgeMinMiss m and at least NudgeMinTime s of burn are
         /// left; it gives NudgeGain of the sideways velocity that would move the end point there.
@@ -413,6 +426,8 @@ namespace MechJebTweaks
                     rzAuto.TryGetValue("BurnTrimInterval", ref RzBurnTrimInterval);
                     rzAuto.TryGetValue("BurnCutSpeed", ref RzBurnCutSpeed);
                     rzAuto.TryGetValue("BurnMaxLateral", ref RzBurnMaxLateral);
+                    rzAuto.TryGetValue("BrakeMaxOrbitShare", ref RzBrakeMaxOrbitShare);
+                    rzAuto.TryGetValue("WaitingMissMargin", ref RzWaitingMissMargin);
                     rzAuto.TryGetValue("BurnLateralShare", ref RzBurnLateralShare);
                     rzAuto.TryGetValue("NudgeMinMiss", ref RzNudgeMinMiss);
                     rzAuto.TryGetValue("NudgeMinTime", ref RzNudgeMinTime);

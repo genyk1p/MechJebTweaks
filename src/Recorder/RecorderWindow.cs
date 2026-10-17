@@ -4,7 +4,7 @@ using UnityEngine;
 
 namespace MechJebTweaks.Recorder
 {
-    /// <summary>"Flight recorder" window in MechJeb's window list: switches <see cref="FlightRecorder"/> on and off.</summary>
+    /// <summary>"Black box" window in MechJeb's window list: switches <see cref="FlightRecorder"/> on and off.</summary>
     public class RecorderWindow : DisplayModule
     {
         public RecorderWindow(MechJebCore core) : base(core)
@@ -14,7 +14,7 @@ namespace MechJebTweaks.Recorder
 
         public override string GetName() => Localizer.Format("#LOC_MJTweaks_REC_Title");
 
-        public override string IconName() => "Flight Recorder";
+        public override string IconName() => "Black Box";
 
         protected override bool IsSpaceCenterUpgradeUnlocked() => Settings.TechUnlocked(Settings.RecorderUnlockTech);
 
